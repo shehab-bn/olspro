@@ -1,0 +1,9 @@
+# OLS PRO build environment — AlmaLinux 9 (same ABI family as cPanel/CloudLinux 9)
+FROM almalinux:9
+RUN dnf -y install epel-release && dnf -y --enablerepo=crb install \
+      gcc gcc-c++ make cmake git golang perl wget which patch \
+      openssl-devel zlib-devel pcre-devel expat-devel libxml2-devel \
+      bzip2-devel libcurl-devel libaio-devel libmaxminddb-devel \
+      lua-devel libunwind-devel ninja-build autoconf automake libtool \
+      redhat-rpm-config file rsync unzip && dnf clean all
+WORKDIR /src

@@ -29,6 +29,9 @@ if (MOD_UPLOADPROGRESS)
     add_subdirectory(uploadprogress)
 endif()
 
+message("Make mod_bruteguard (OLS PRO)")
+add_subdirectory(modbruteguard)
+
 if (MOD_LSPHP)
     message("Make mod_lsphp")
     add_subdirectory(mod_lsphp)

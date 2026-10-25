@@ -13,6 +13,8 @@ docker --context colima-olspro run --rm -v "$PWD":/host:ro -v olspro-build-cache
         --exclude="/libmaxminddb*" --exclude="/IP2Location*" --exclude=/build --exclude=/third-party \
         /host/ /build/src/
   cd /build/src
+  # newer brotli drops the -static suffix upstream's CMake still asks for
+  for l in common dec enc; do ln -sf libbrotli$l.a /build/third-party/lib/libbrotli$l-static.a; done
   rm -rf lsquic && git -c protocol.file.allow=always submodule update --init --recursive lsquic
   ./build.sh -p OFF -o ON -l OFF '"$*"'
   ls -l build/openlitespeed && build/openlitespeed -v || true

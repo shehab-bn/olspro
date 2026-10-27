@@ -1556,7 +1556,13 @@ int RewriteEngine::processRuleSet(const RewriteRuleList *pRuleList,
             }
             continue;
         }
-        if ((flag & RULE_FLAG_LAST) && !pRule->getSkip())
+        // OLS PRO (G3): with status parity on, a matched status-only rule
+        // ([F], [G], [R=4xx/5xx]) ends processing even with [S=n]/[C]/[N],
+        // like Apache's ACTION_STATUS return. Otherwise a later [R=301] or
+        // [P] rule could overwrite m_action and turn a block into a
+        // redirect or proxy. Upstream ignored the implied [L] when [S=n] set.
+        if (((flag & RULE_FLAG_LAST) && !pRule->getSkip())
+            || pRule->isStatusStop())
         {
             if (m_logLevel > 5)
                 LS_INFO(pSession,
@@ -1614,8 +1620,13 @@ NEXT_RULE:
 
     if (m_rewritten)
     {
-        if ((m_action == RULE_ACTION_FORBID) ||
-            (m_action == RULE_ACTION_GONE))
+        // OLS PRO (G3): with status parity on, [R=4xx/5xx] is a status
+        // response, not a redirect, even when an earlier rule already
+        // rewrote the URL. Off: upstream path below, unchanged.
+        if (RewriteRule::getStatusParity() &&
+            ((m_action == RULE_ACTION_FORBID) ||
+             (m_action == RULE_ACTION_GONE) ||
+             ((m_action == RULE_ACTION_REDIRECT) && (m_statusCode >= SC_400))))
             return m_statusCode;
         if (m_rewritten & 2)
         {

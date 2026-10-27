@@ -1,0 +1,13 @@
+# OLS PRO shimguard (ROADMAP G10): re-check every 5 minutes so a licence
+# cron that re-drops the shim is reverted before the crash loop starts.
+[Unit]
+Description=OLS PRO licence-shim guard timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

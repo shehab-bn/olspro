@@ -1,0 +1,47 @@
+# OLS PRO - Prometheus exporter for OpenLiteSpeed real-time stats.
+# Install:
+#   useradd --system --no-create-home --shell /usr/sbin/nologin ols-exporter
+#   install -m 0755 ols_exporter.py /usr/local/sbin/ols_exporter.py
+#   install -m 0644 ols-exporter.service /etc/systemd/system/
+#   # shared hosting: require a token (any local user can reach 127.0.0.1)
+#   install -d -m 0750 -o root -g ols-exporter /etc/ols-exporter
+#   head -c 32 /dev/urandom | base64 > /etc/ols-exporter/token
+#   chown ols-exporter: /etc/ols-exporter/token && chmod 0600 /etc/ols-exporter/token
+#   #   ...then add --auth-token-file /etc/ols-exporter/token to ExecStart and
+#   #   set bearer_token_file in the Prometheus scrape config.
+#   # optional extra fence: only root/prometheus may connect to the port
+#   #   nft add rule inet filter output tcp dport 9101 meta skuid != { 0, prometheus } drop
+#   systemctl daemon-reload && systemctl enable --now ols-exporter
+# Scrape: http://127.0.0.1:9101/metrics (loopback only; front it with a
+# reverse proxy + auth or an SSH tunnel if Prometheus is remote).
+# Many vhosts? add --no-vhost-metrics, --vhost-include/--vhost-exclude REGEX
+# or --skip-idle-vhosts to ExecStart to bound the series count.
+[Unit]
+Description=OLS PRO Prometheus exporter (OpenLiteSpeed .rtreport)
+# Ordering only. No Wants=/Requires=: the exporter must never start the web
+# server (OLS may be installed but deliberately stopped, e.g. rolled back to
+# Apache); it reports ols_up 0 when no fresh report exists.
+After=network.target lshttpd.service lsws.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/ols_exporter.py --listen 127.0.0.1 --port 9101 --dir /tmp/lshttpd
+Restart=on-failure
+RestartSec=5
+# .rtreport* are written 0644 under /tmp/lshttpd; read-only access is all we
+# need. Do NOT set PrivateTmp (or DynamicUser, which implies it): either
+# would hide /tmp/lshttpd. A dedicated user (not nobody, which is often the
+# web/PHP user) keeps the token file private. No Group=: systemd uses the
+# user's primary group, so the unit works on RHEL and Debian alike.
+User=ols-exporter
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

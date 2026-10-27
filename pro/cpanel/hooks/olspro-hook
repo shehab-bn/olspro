@@ -1,0 +1,655 @@
+#!/bin/bash
+#############################################################################
+#    OLS PRO - cPanel Standardized Hook: keep OLS in sync with httpd.conf.  #
+#    GPLv3, see GPL.txt                                                     #
+#############################################################################
+#
+# Modes:
+#   olspro-hook --describe        JSON hook list for /usr/local/cpanel/bin/manage_hooks
+#   olspro-hook --event <name>    called by cPanel (hook JSON on stdin). Marks a
+#                                 regen as pending, spawns the worker, returns
+#                                 "1 OK" immediately. NEVER fails the cPanel action.
+#   olspro-hook --worker          debounced regen loop (one at a time, flock).
+#   olspro-hook --now [--force]   run one regen in the foreground (admin/debug);
+#                                 --force skips the vhost-count sanity checks.
+#   olspro-hook --check           backstop (cron): queue a regen if httpd.conf
+#                                 changed since the last sync without any hook
+#                                 firing (rebuildhttpdconf, EasyApache, AutoSSL...).
+#
+# What a regen does (ROADMAP G1/G7):
+#   1. wait until /etc/apache2/conf/httpd.conf has stopped changing (cPanel
+#      rebuilds it after the hook fires, sometimes via the task queue); if it
+#      never settles, the event is re-queued (bounded retries);
+#   2. apache2ols httpd.conf -> a NEW generation dir $OUT.d/g.<ts>.<pid>.
+#      $OUT itself is a symlink to the live generation and is only swapped
+#      (atomically, ln -s + mv -T) once the new one is complete, so $OUT is
+#      never missing or half-written, whatever kills us mid-way;
+#   3. sanity checks: every referenced vhconf exists and is non-empty, disk
+#      not full, httpd.conf not truncated, vhost count consistent with
+#      httpd.conf / the account list;
+#   4. openlitespeed -t (output parsed, see validate_ols); failure -> $OUT is
+#      pointed back at the previous generation, no reload;
+#   5. graceful reload (lswsctrl restart == SIGUSR1) if OLS is running. If it
+#      is down, it is started only when OLS is the designated web server
+#      (ACTIVE_WEBSERVER) and nothing else owns :80;
+#   6. if OLS died after the reload, roll back to the previous generation and
+#      start it again.
+#
+# Settings: /etc/olspro/cpanel-hook.conf (shell vars, optional), see defaults below.
+
+# Never inherit these from the caller's environment; only the conf file sets them.
+unset LSWS HTTPD_CONF APACHE_ROOT APACHE2OLS OUT GEN_BASE LOG STATE_DIR PIDFILE \
+      DEBOUNCE STABLE_SECS STABLE_MAX MIN_KEEP_PCT NATIVE ENABLED ACTIVE_WEBSERVER \
+      MIN_FREE_MB MAX_RETRIES VALIDATE_STRICT VALIDATE_TIMEOUT TRUEUSERDOMAINS
+
+HOOK_CONF="${OLSPRO_HOOK_CONF:-/etc/olspro/cpanel-hook.conf}"
+# shellcheck disable=SC1090
+[ -r "$HOOK_CONF" ] && . "$HOOK_CONF"
+
+HOOK_PATH="${OLSPRO_HOOK_PATH:-/usr/local/olspro/cpanel/olspro-hook}"
+: "${LSWS:=/usr/local/lsws}"
+: "${HTTPD_CONF:=/etc/apache2/conf/httpd.conf}"
+: "${APACHE_ROOT:=/etc/apache2}"
+: "${APACHE2OLS:=$LSWS/bin/apache2ols}"
+: "${OUT:=$LSWS/conf/olspro-apache}"     # symlink -> live generation dir
+: "${GEN_BASE:=$OUT.d}"                  # generation dirs live here
+: "${LOG:=$LSWS/logs/olspro-hook.log}"
+: "${STATE_DIR:=/var/lib/olspro}"         # persistent (not tmpfs): survives reboot
+: "${TRUEUSERDOMAINS:=/etc/trueuserdomains}"
+: "${DEBOUNCE:=8}"          # seconds to coalesce a burst of events
+: "${STABLE_SECS:=3}"       # httpd.conf mtime must be unchanged this long
+: "${STABLE_MAX:=120}"      # give up waiting for a stable httpd.conf after this
+: "${MAX_RETRIES:=5}"       # re-queue that many times when httpd.conf never settles
+: "${MIN_KEEP_PCT:=50}"     # apache2ols must see >= 50% of httpd.conf's vhosts / accounts
+: "${MIN_FREE_MB:=64}"      # refuse to generate below this much free space
+: "${NATIVE:=0}"            # 1 = OLS loads httpd.conf itself (M1 loader): reload only
+: "${ENABLED:=1}"           # 0 = hook is a no-op (kill switch)
+: "${ACTIVE_WEBSERVER:=auto}" # ols | apache | auto (start OLS only if it was seen serving)
+: "${VALIDATE_STRICT:=0}"   # 1 = any [ERROR] from openlitespeed -t fails the regen
+: "${VALIDATE_TIMEOUT:=30}"
+if [ -z "${PIDFILE:-}" ]; then
+    # lswsctrl uses the build-time PIDFILE from lsws_env; read it without
+    # letting the file touch our own variables.
+    [ -r "$LSWS/bin/lsws_env" ] && \
+        PIDFILE=$( . "$LSWS/bin/lsws_env" >/dev/null 2>&1; printf '%s' "${PIDFILE:-}")
+    : "${PIDFILE:=/tmp/lshttpd/lshttpd.pid}"
+fi
+
+LOCK="$STATE_DIR/hook.lock"
+PENDING="$STATE_DIR/hook.pending"
+FORCE=0
+PREV_GEN=""
+EX_RETRY=75
+
+log()
+{
+    mkdir -p "$(dirname "$LOG")" 2>/dev/null
+    if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+        mv -f "$LOG" "$LOG.1" 2>/dev/null
+    fi
+    printf '%s [%s] %s\n' "$(date '+%F %T')" "$$" "$*" >> "$LOG" 2>/dev/null
+}
+
+pid_is_ols()
+{
+    local pid="$1" comm
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+    # Guard against a stale pidfile whose pid got reused.
+    if [ -r "/proc/$pid/comm" ]; then
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+        case "$comm" in
+            *litespeed*|lshttpd*|openlitespeed*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+ols_running()
+{
+    local f
+    for f in "$PIDFILE" /var/run/openlitespeed.pid; do
+        [ -f "$f" ] || continue
+        pid_is_ols "$(cat "$f" 2>/dev/null)" && return 0
+    done
+    return 1
+}
+
+describe()
+{
+    local first=1 spec cat ev esc
+    printf '['
+    for spec in \
+        'Whostmgr:Accounts::Create' \
+        'Whostmgr:Accounts::Remove' \
+        'Whostmgr:Accounts::Modify' \
+        'Whostmgr:Accounts::suspendacct' \
+        'Whostmgr:Accounts::unsuspendacct' \
+        'Whostmgr:Domain::park' \
+        'Whostmgr:Domain::unpark' \
+        'Whostmgr:PkgAcct::Restore' \
+        'Cpanel:Api2::Park::park' \
+        'Cpanel:Api2::Park::unpark' \
+        'Cpanel:Api2::SubDomain::addsubdomain' \
+        'Cpanel:Api2::SubDomain::delsubdomain' \
+        'Cpanel:Api2::AddonDomain::addaddondomain' \
+        'Cpanel:Api2::AddonDomain::deladdondomain' \
+        'Cpanel:UAPI::SubDomain::addsubdomain' \
+        'Cpanel:UAPI::SSL::install_ssl'
+    do
+        cat=${spec%%:*}
+        ev=${spec#*:}
+        # Cpanel-category hooks run as the account user unless escalated; as
+        # that user we cannot touch $STATE_DIR, $LOG or $LSWS/conf and every
+        # addon/sub/parked domain would be silently dropped.
+        esc=""
+        [ "$cat" = "Cpanel" ] && esc=',"escalateprivs":1'
+        [ $first -eq 1 ] || printf ','
+        first=0
+        printf '{"category":"%s","event":"%s","stage":"post","hook":"%s --event %s:%s","exectype":"script"%s}' \
+            "$cat" "$ev" "$HOOK_PATH" "$cat" "$ev" "$esc"
+    done
+    printf ']\n'
+}
+
+conf_hash()
+{
+    cksum < "$HTTPD_CONF" 2>/dev/null | awk '{print $1 "-" $2}'
+}
+
+# Wait until httpd.conf has not changed for STABLE_SECS (cPanel may still be
+# writing it). Returns 1 if it never settles within STABLE_MAX.
+wait_stable()
+{
+    local waited=0 m1 m2
+    while :; do
+        m1=$(stat -c %Y "$HTTPD_CONF" 2>/dev/null)
+        sleep "$STABLE_SECS"
+        waited=$((waited + STABLE_SECS))
+        m2=$(stat -c %Y "$HTTPD_CONF" 2>/dev/null)
+        [ -n "$m1" ] && [ "$m1" = "$m2" ] && return 0
+        [ "$waited" -lt "$STABLE_MAX" ] || return 1
+    done
+}
+
+vhost_count()
+{
+    # apache2ols prints "<N> vhosts, <M> listeners, ..." on stderr.
+    sed -n 's/^\([0-9][0-9]*\) vhosts,.*/\1/p' "$1" 2>/dev/null | tail -n 1
+}
+
+free_kb()
+{
+    df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+# Atomically point the $OUT symlink at generation dir $1.
+point_out()
+{
+    local tmp="$OUT.tmp.$$"
+    rm -f "$tmp"
+    ln -s "$1" "$tmp" || return 1
+    if ! mv -Tf "$tmp" "$OUT"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    return 0
+}
+
+# Pre-generation installs had $OUT as a real directory (+ $OUT.prev). Move it
+# into $GEN_BASE and leave a symlink: its baked "$OUT/vhosts/..." paths still
+# resolve through the symlink, so it stays a valid rollback target.
+migrate_legacy()
+{
+    local legacy
+    mkdir -p "$GEN_BASE" || return 1
+    if [ -d "$OUT" ] && [ ! -L "$OUT" ]; then
+        legacy="$GEN_BASE/legacy.$(date +%s)"
+        mv "$OUT" "$legacy" || return 1
+        if ! point_out "$legacy"; then
+            mv "$legacy" "$OUT"
+            return 1
+        fi
+        log "migrated $OUT to generation layout ($OUT -> $legacy)"
+    fi
+    [ -d "$OUT.prev" ] && rm -rf "$OUT.prev"
+    return 0
+}
+
+empty_gen()
+{
+    local e="$GEN_BASE/empty"
+    mkdir -p "$e" || return 1
+    [ -s "$e/olspro_apache.conf" ] || \
+        printf '# OLS PRO: no generated Apache vhosts (initial sync did not validate)\n' \
+            > "$e/olspro_apache.conf" || return 1
+    printf '%s' "$e"
+}
+
+restore_prev()
+{
+    local target="$PREV_GEN"
+    [ "$NATIVE" = "1" ] && return 0
+    if [ -z "$target" ] || [ ! -d "$target" ]; then
+        # First sync: never leave an unvalidated config behind $OUT.
+        target=$(empty_gen) || { log "restore: cannot create empty generation"; return 1; }
+    fi
+    if point_out "$target"; then
+        log "restored $OUT -> $target"
+        return 0
+    fi
+    log "restore: FAILED to point $OUT back at $target"
+    return 1
+}
+
+prune_gens()
+{
+    local cur d
+    cur=$(readlink "$OUT" 2>/dev/null)
+    for d in "$GEN_BASE"/g.* "$GEN_BASE"/legacy.*; do
+        [ -d "$d" ] || continue
+        if [ "$d" = "$cur" ] || [ "$d" = "$PREV_GEN" ]; then
+            continue
+        fi
+        rm -rf "$d"
+    done
+}
+
+keep_failed()
+{
+    rm -rf "$GEN_BASE/failed"
+    mv "$1" "$GEN_BASE/failed" 2>/dev/null || rm -rf "$1"
+}
+
+# Verify a generation dir is complete: apache2ols ignores write errors, so a
+# full disk would otherwise leave truncated/missing files with rc 0.
+verify_gen()
+{
+    local g="$1" f bad=0 n=0
+    [ -s "$g/olspro_apache.conf" ] || { log "verify: empty $g/olspro_apache.conf"; return 1; }
+    if ! awk '{ o += gsub(/\{/, "{"); c += gsub(/\}/, "}") } END { exit (o == c) ? 0 : 1 }' \
+            "$g/olspro_apache.conf"; then
+        log "verify: unbalanced braces in $g/olspro_apache.conf (truncated?)"
+        return 1
+    fi
+    while read -r f; do
+        [ -n "$f" ] || continue
+        n=$((n + 1))
+        if [ ! -s "$f" ]; then
+            bad=$((bad + 1))
+            [ $bad -le 3 ] && log "verify: missing/empty $f"
+        fi
+    done < <(sed -n 's/^[[:space:]]*configFile[[:space:]][[:space:]]*//p' "$g/olspro_apache.conf")
+    [ $bad -eq 0 ] || { log "verify: $bad of $n vhost configs missing/empty"; return 1; }
+    return 0
+}
+
+# Is httpd.conf itself intact, and did apache2ols see what it contains?
+# (Replaces the old history-based guard, which locked the hook out after any
+# legitimate bulk removal and reset on every reboot.)
+sanity_counts()
+{
+    local n="$1" open close accts
+    open=$(grep -ciE '^[[:space:]]*<VirtualHost[[:space:]>]' "$HTTPD_CONF" 2>/dev/null)
+    close=$(grep -ciE '^[[:space:]]*</VirtualHost>' "$HTTPD_CONF" 2>/dev/null)
+    : "${open:=0}" "${close:=0}"
+    if [ "$open" -ne "$close" ]; then
+        log "httpd.conf looks truncated: $open <VirtualHost> vs $close </VirtualHost>, refusing"
+        return 1
+    fi
+    if [ "$open" -gt 0 ] && [ $((n * 100)) -lt $((open * MIN_KEEP_PCT)) ]; then
+        log "apache2ols parsed $n vhosts but httpd.conf has $open (< ${MIN_KEEP_PCT}%), refusing"
+        return 1
+    fi
+    if [ -r "$TRUEUSERDOMAINS" ]; then
+        accts=$(grep -c . "$TRUEUSERDOMAINS" 2>/dev/null)
+        : "${accts:=0}"
+        if [ "$accts" -gt 0 ] && [ $((n * 100)) -lt $((accts * MIN_KEEP_PCT)) ]; then
+            log "only $n vhosts for $accts cPanel accounts (< ${MIN_KEEP_PCT}%), refusing (truncated httpd.conf?)"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# openlitespeed -t: the error log goes to $TMP/testconf at level WARN; OLS
+# prints that file and exits 1 if it has ANY content, 2 if it contains
+# "[ERROR]" (lshttpdmain.cpp), while config() failures do not change the exit
+# code themselves. So the exit code is not a verdict: one WARN anywhere gives
+# 1, and one account's bad cert (a per-vhost [ERROR] a running OLS just skips)
+# gives 2. We parse the output: server/listener-level errors are fatal,
+# per-vhost errors (log id ...:vhost:<name>...) and WARNs are only logged.
+validate_ols()
+{
+    local bin out rc errs fatal nwarn
+    bin="$LSWS/bin/openlitespeed"
+    [ -x "$bin" ] || bin="$LSWS/bin/lshttpd"
+    [ -x "$bin" ] || { log "validate: no OLS binary, skipping -t"; return 0; }
+    out=$(cd "$LSWS" && timeout "$VALIDATE_TIMEOUT" "$bin" -t 2>&1)
+    rc=$?
+    if [ $rc -gt 2 ]; then
+        log "validate: openlitespeed -t did not complete (rc=$rc): $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+        return 1
+    fi
+    errs=$(printf '%s\n' "$out" | grep -E '\[ERROR\]|Fatal error')
+    if [ "$VALIDATE_STRICT" = "1" ]; then
+        fatal="$errs"
+    else
+        fatal=$(printf '%s\n' "$errs" | grep -E 'Fatal error|No listener is available|No virtual host is available'
+                printf '%s\n' "$errs" | grep -vE ':(vhost|vhTemplate|vhostTemplate):|Fatal error|No listener is available|No virtual host is available')
+    fi
+    fatal=$(printf '%s\n' "$fatal" | grep -v '^[[:space:]]*$')
+    if [ -n "$fatal" ]; then
+        log "validate: openlitespeed -t failed (rc=$rc): $(printf '%s\n' "$fatal" | head -n 5 | tr '\n' ' ')"
+        return 1
+    fi
+    nwarn=$(printf '%s\n' "$out" | grep -c '\[WARN\]')
+    if [ -n "$errs" ]; then
+        log "validate: OK with per-vhost errors (those vhosts are skipped by OLS): $(printf '%s\n' "$errs" | head -n 5 | tr '\n' ' ')"
+    fi
+    [ "${nwarn:-0}" -gt 0 ] && log "validate: OK with $nwarn warning(s): $(printf '%s\n' "$out" | grep '\[WARN\]' | head -n 3 | tr '\n' ' ')"
+    return 0
+}
+
+port80_users()
+{
+    # Prints the listeners on :80 (empty = free). Returns 1 if we cannot tell.
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnpH '( sport = :80 )' 2>/dev/null
+        return 0
+    fi
+    return 1
+}
+
+start_ols()
+{
+    "$LSWS/bin/lswsctrl" start >/dev/null 2>&1
+    sleep 3
+    ols_running
+}
+
+reload_ols()
+{
+    local want=0 users
+    if ! ols_running; then
+        case "$ACTIVE_WEBSERVER" in
+            ols)    want=1 ;;
+            apache) want=0 ;;
+            *)      [ -f "$STATE_DIR/ols.active" ] && want=1 ;;
+        esac
+        if [ $want -eq 0 ]; then
+            log "OLS not running -> config refreshed, NOT starting it (ACTIVE_WEBSERVER=$ACTIVE_WEBSERVER)"
+            return 0
+        fi
+        if ! users=$(port80_users); then
+            log "OLS is the designated web server but is down; cannot check :80 (no ss) -> NOT starting it"
+            return 0
+        fi
+        if [ -n "$users" ]; then
+            log "OLS is down and :80 is owned by another server ($(printf '%s' "$users" | head -n 1 | tr -s ' ')) -> NOT starting OLS"
+            [ "$ACTIVE_WEBSERVER" = "auto" ] && rm -f "$STATE_DIR/ols.active"
+            return 0
+        fi
+        log "OLS is the designated web server (ACTIVE_WEBSERVER=$ACTIVE_WEBSERVER) and is down, :80 free -> starting it"
+        if start_ols; then
+            log "OLS started"
+            return 0
+        fi
+        log "OLS failed to start on the new config -> rolling back"
+        restore_prev
+        if start_ols; then
+            log "rollback: OLS up on previous config"
+        else
+            log "rollback: OLS STILL DOWN -- manual action needed ($LSWS/logs/error.log)"
+        fi
+        return 1
+    fi
+    [ "$ACTIVE_WEBSERVER" = "auto" ] && : > "$STATE_DIR/ols.active"
+    "$LSWS/bin/lswsctrl" restart >/dev/null 2>&1
+    sleep 4
+    if ols_running; then
+        log "graceful restart OK"
+        return 0
+    fi
+    log "OLS not running after graceful restart -> rolling back"
+    restore_prev
+    if start_ols; then
+        log "rollback: OLS back up on previous config"
+    else
+        log "rollback: OLS STILL DOWN -- manual action needed ($LSWS/logs/error.log)"
+    fi
+    return 1
+}
+
+mark_synced() { printf '%s\n' "$1" > "$STATE_DIR/httpd.synced"; rm -f "$STATE_DIR/httpd.failed"; }
+mark_failed() { [ -n "$1" ] && printf '%s\n' "$1" > "$STATE_DIR/httpd.failed"; }
+
+# Returns 0 ok, 1 failed (do not retry this httpd.conf), 75 retry later.
+regen()
+{
+    local err prev_n new_n h gen free need cur_kb rc
+    PREV_GEN=""
+    if [ "$ENABLED" != "1" ]; then
+        log "disabled (ENABLED=$ENABLED), skipping"
+        return 0
+    fi
+    if ! wait_stable; then
+        log "httpd.conf still changing after ${STABLE_MAX}s, will retry"
+        return $EX_RETRY
+    fi
+    if [ ! -s "$HTTPD_CONF" ]; then
+        log "missing/empty $HTTPD_CONF, skipping"
+        return 1
+    fi
+    h=$(conf_hash)
+
+    if [ "$NATIVE" = "1" ]; then
+        log "NATIVE=1: OLS reads httpd.conf directly, reload only"
+        if validate_ols && reload_ols; then
+            mark_synced "$h"
+            return 0
+        fi
+        mark_failed "$h"
+        return 1
+    fi
+
+    if [ ! -x "$APACHE2OLS" ]; then
+        log "apache2ols not found at $APACHE2OLS, skipping"
+        return 1
+    fi
+    if ! migrate_legacy; then
+        log "cannot set up generation dir $GEN_BASE, skipping"
+        return 1
+    fi
+    PREV_GEN=$(readlink "$OUT" 2>/dev/null)
+    [ -n "$PREV_GEN" ] && [ ! -d "$PREV_GEN" ] && PREV_GEN=""
+
+    # Refuse up front when the disk is (nearly) full.
+    free=$(free_kb "$GEN_BASE")
+    cur_kb=0
+    [ -n "$PREV_GEN" ] && cur_kb=$(du -sk "$PREV_GEN" 2>/dev/null | awk '{print $1}')
+    need=$((MIN_FREE_MB * 1024 + 2 * ${cur_kb:-0}))
+    if [ -n "$free" ] && [ "$free" -lt "$need" ]; then
+        log "only ${free}KB free under $GEN_BASE (need ${need}KB), NOT regenerating"
+        return 1
+    fi
+
+    err="$STATE_DIR/apache2ols.err"
+    prev_n=""
+    [ -f "$STATE_DIR/vhosts.count" ] && prev_n=$(cat "$STATE_DIR/vhosts.count" 2>/dev/null)
+    if ! gen=$(mktemp -d "$GEN_BASE/g.$(date +%Y%m%d%H%M%S).XXXXXX") || \
+       ! chmod 0755 "$gen"; then
+        log "cannot create a generation dir under $GEN_BASE, skipping"
+        [ -n "$gen" ] && rm -rf "$gen"
+        return 1
+    fi
+    # apache2ols bakes absolute paths under $gen into olspro_apache.conf; the
+    # live config only switches to them when $OUT is re-pointed below.
+    if ! "$APACHE2OLS" --root "$APACHE_ROOT" --out "$gen" --warnings "$HTTPD_CONF" 2> "$err"; then
+        log "apache2ols failed: $(head -n 3 "$err" | tr '\n' ' ')"
+        rm -rf "$gen"
+        mark_failed "$h"
+        return 1
+    fi
+    new_n=$(vhost_count "$err")
+    if [ -z "$new_n" ] || ! verify_gen "$gen"; then
+        log "apache2ols produced no usable/complete output, live config untouched"
+        rm -rf "$gen"
+        return 1
+    fi
+    free=$(free_kb "$gen")
+    if [ -n "$free" ] && [ "$free" -lt 1024 ]; then
+        log "disk full after generation (${free}KB free), output may be truncated, live config untouched"
+        rm -rf "$gen"
+        return 1
+    fi
+    if [ "$FORCE" != "1" ] && ! sanity_counts "$new_n"; then
+        rm -rf "$gen"
+        mark_failed "$h"
+        return 1
+    fi
+    log "apache2ols: $(grep -m1 ' vhosts,' "$err") (prev ${prev_n:-?}; $(grep -c '^WARN' "$err") warnings, see $err)"
+
+    if ! point_out "$gen"; then
+        log "cannot re-point $OUT at $gen, live config untouched"
+        rm -rf "$gen"
+        return 1
+    fi
+    if ! validate_ols; then
+        restore_prev
+        keep_failed "$gen"
+        log "failed generation kept in $GEN_BASE/failed"
+        mark_failed "$h"
+        return 1
+    fi
+    echo "$new_n" > "$STATE_DIR/vhosts.count"
+    reload_ols
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        mark_synced "$h"
+    else
+        mark_failed "$h"
+        [ "$(readlink "$OUT" 2>/dev/null)" = "$gen" ] || keep_failed "$gen"
+    fi
+    prune_gens
+    return $rc
+}
+
+spawn_worker()
+{
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$HOOK_SELF" --worker </dev/null >/dev/null 2>&1 &
+    else
+        nohup "$HOOK_SELF" --worker </dev/null >/dev/null 2>&1 &
+    fi
+}
+
+queue()
+{
+    echo "$(date +%s) $1" >> "$PENDING" 2>/dev/null
+}
+
+worker()
+{
+    local retries=0 rc
+    exec 9> "$LOCK"
+    if ! flock -n 9; then
+        exit 0      # a worker is already running; it will pick up PENDING
+    fi
+    while [ -e "$PENDING" ]; do
+        log "worker: events: $(tr '\n' ' ' < "$PENDING" 2>/dev/null)"
+        rm -f "$PENDING"
+        sleep "$DEBOUNCE"
+        # Events that arrived during the debounce window are covered by this run.
+        rm -f "$PENDING"
+        regen
+        rc=$?
+        if [ $rc -eq $EX_RETRY ]; then
+            retries=$((retries + 1))
+            if [ $retries -le "$MAX_RETRIES" ]; then
+                queue "retry$retries"
+            else
+                log "worker: httpd.conf never settled after $MAX_RETRIES retries; the --check backstop will pick it up"
+            fi
+        else
+            retries=0
+        fi
+    done
+    flock -u 9
+    exec 9>&-
+    # An event that landed between the last check and the unlock found the
+    # lock busy and relied on us: hand over to a fresh worker.
+    if [ -e "$PENDING" ]; then
+        exec "$HOOK_SELF" --worker
+    fi
+    exit 0
+}
+
+# Backstop for httpd.conf rewrites that fire none of our hooks
+# (/scripts/rebuildhttpdconf, EasyApache, AutoSSL first cert, ...).
+check_backstop()
+{
+    local h
+    [ "$ENABLED" = "1" ] || return 0
+    [ -s "$HTTPD_CONF" ] || return 0
+    h=$(conf_hash)
+    [ -n "$h" ] || return 0
+    [ "$h" = "$(cat "$STATE_DIR/httpd.synced" 2>/dev/null)" ] && return 0
+    # Same httpd.conf already failed validation: don't loop on it.
+    [ "$h" = "$(cat "$STATE_DIR/httpd.failed" 2>/dev/null)" ] && return 0
+    log "backstop: httpd.conf changed since last sync, queueing regen"
+    queue "backstop"
+    spawn_worker
+}
+
+HOOK_SELF="$0"
+[ "${OLSPRO_HOOK_LIB:-0}" = "1" ] && return 0 2>/dev/null
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+case "$1" in
+    --describe)
+        describe
+        ;;
+    --worker)
+        worker
+        ;;
+    --check)
+        check_backstop
+        ;;
+    --now)
+        [ "${2:-}" = "--force" ] && FORCE=1
+        exec 9> "$LOCK"
+        flock -w 300 9 || { echo "lock busy"; exit 1; }
+        # Events queued so far are covered by this run (it reads httpd.conf
+        # after they fired); later ones are handed to a worker below.
+        rm -f "$PENDING"
+        regen
+        rc=$?
+        tail -n 20 "$LOG"
+        flock -u 9
+        exec 9>&-
+        [ -e "$PENDING" ] && spawn_worker
+        exit $rc
+        ;;
+    *)
+        # cPanel hook invocation: the event context JSON arrives on stdin.
+        # Drain it fully (so cPanel never sees EPIPE) but log only user/domain:
+        # Accounts::Create context carries the account password.
+        ev="${2:-unknown}"
+        [ "$1" = "--event" ] || ev="${1:-unknown}"
+        ctx=""
+        if [ ! -t 0 ]; then
+            # Read stdin completely first: a pipeline ending in `head` could
+            # stop reading early and hand cPanel an EPIPE.
+            ctx=$(cat 2>/dev/null)
+            ctx=$(printf '%s' "$ctx" | grep -oE '"(user|domain|newdomain|rootdomain)" *: *"[^"]{1,128}"' | head -n 4 | tr '\n' ' ')
+        fi
+        log "event $ev ${ctx:+($ctx)}"
+        queue "$ev"
+        spawn_worker
+        echo "1 OK"
+        exit 0
+        ;;
+esac
+exit 0

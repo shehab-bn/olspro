@@ -80,3 +80,34 @@ metrics; consumed by sam's OLS PRO page.
 - Every milestone ships behind a config flag defaulting to upstream behaviour.
 - Each feature lands with a test in `pro/tests/` (parser fixtures, curl-based
   parity harness).
+
+## Known upstream bugs (found by the OLS PRO smoke suite)
+
+- **Directory index checked against the directory's mode.** With no
+  `fileAccessControl` block (built-in `restrictedPermissionMask` 041111) and a
+  single-entry `indexFiles index.html`, `GET /` returns 403 ("Permission of file
+  .../index.html does not meet the requirements...") while `GET /index.html`
+  returns 200; `indexFiles index.php, index.html` returns 200. Masked in stock
+  installs because the shipped config sets the masks to 000. Repro: 2026-10-27 in
+  olspro-dev. Suspect the URL static-file cache path (`HttpReq` ~4417
+  `getUrlStaticFileData`, `HttpSession` ~2871) carrying the directory stat;
+  not yet root-caused.
+
+## Status 2026-10-27 (sprint: 9 features, each independently reviewed + fixed + re-checked)
+
+Verified on a real build (olspro-dev, AlmaLinux 9, gcc 11): `pro/tests/smoke/smoke.sh`
+15/15 PASS — static 200, `-t` clean, mod_bruteguard 429 + Retry-After with no
+worker crash (the first version segfaulted the server: hook returned 429 instead
+of LSI_ERROR), Apache-converted cPanel fixture serves 301 → https 200 with a
+verified chain.
+
+| Gap | Delivered | Verified how | Not yet |
+|-----|-----------|--------------|---------|
+| G1 | `src/main/apacheconf_loader.*`: env `OLSPRO_APACHE_CONF` renders into `$SERVER_ROOT/apache-generated/` (root-owned, O_NOFOLLOW, atomic generations) | compile + Mac unit tests | not exercised against a real cPanel httpd.conf |
+| G2/G7 | `pro/cpanel/`: standardized hooks, debounce, validated symlink-swap + rollback, service-subdomain proxy generator | bash -n, describe JSON, sandbox tree | never run on cPanel |
+| G3 | `[F]`/`[G]`/`[R=4xx]` Apache parity, behind `OLSPRO_REWRITE_STATUS_PARITY=1` | parse-level tests on built objects | no request-level test |
+| G5 | `mod_bruteguard`: shared-memory counters across workers, LRU-bounded, allowlist, extra paths | smoke 429 path | per-vhost keys, xmlrpc-specific limit |
+| G9 | `pro/tools/ols-exporter/`: Prometheus exporter, per-worker counters | 12 unit tests | not checked against LSWS Enterprise `.rtreport` |
+| G10 | `pro/security/olspro-shimguard.sh` check/fix/watch + systemd units | 28 assertions on fake tree | installer does not call `record` after upgrades |
+| ESI | `src/modules/cache/esi/`: streaming parser/assembler with input/CPU limits | 82 tests incl. ASan/UBSan | not wired into cache.cpp |
+| CPNS | `pro/cpns/`: integration contract + pre-reload validator (JSON) | fake layout | CPNS does not call it yet |

@@ -1,0 +1,13 @@
+# OLS PRO shimguard (ROADMAP G10) - one watch pass; driven by olspro-shimguard.timer.
+# Install script as /usr/local/sbin/olspro-shimguard.
+[Unit]
+Description=OLS PRO licence-shim guard (watch pass)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/olspro-shimguard watch
+# exit 1 = findings were seen (and fixed); do not mark the unit failed for that.
+SuccessExitStatus=1
+Nice=10
+IOSchedulingClass=idle

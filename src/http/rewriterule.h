@@ -76,6 +76,10 @@ enum RWCOND_OPS
 #define RULE_FLAG_QSDISCARD     (1<<12)
 #define RULE_FLAG_END           (1<<13)
 #define RULE_FLAG_BR_ESCAPE     (1<<14)
+// OLS PRO (G3): marks a status-only rule ([F], [G], [R=4xx/5xx]). On its own
+// it changes nothing; it only takes effect when status parity is enabled,
+// see RewriteRule::setStatusParity().
+#define RULE_FLAG_STATUS        (1<<15)
 
 #define RULE_FLAG_BNP           (1<<19)
 #define RULE_FLAG_BCTLS         (1<<20)
@@ -243,7 +247,23 @@ public:
     const char    *getNoEscape() const
     {   return (const char *)&m_noEscape;    }
     short          getAction() const    {   return m_action;                }
-    int            getFlag() const      {   return m_flag;                  }
+    // Effective flags. With status parity on, a status-only rule also carries
+    // [L] and drops its substitution (Apache semantics); otherwise this is
+    // exactly the parsed flag set (upstream OpenLiteSpeed behaviour).
+    // RULE_FLAG_STATUS is internal and never leaves the rule: the engine
+    // copies flags into a short (RewriteEngine::m_flag), where bit 15 would
+    // sign-extend into the escape bits and change parity-off behaviour.
+    int            getFlag() const
+    {
+        int flag = m_flag & ~RULE_FLAG_STATUS;
+        if ((m_flag & RULE_FLAG_STATUS) && s_iStatusParity)
+            return flag | RULE_FLAG_LAST | RULE_FLAG_NOREWRITE;
+        return flag;
+    }
+    // True when this rule must end rule processing as soon as it matches,
+    // ignoring [S=n], [C] and [N] (Apache returns ACTION_STATUS right away).
+    bool    isStatusStop() const
+    {   return (m_flag & RULE_FLAG_STATUS) && s_iStatusParity;     }
     int     getStatusCode() const       {   return m_statusCode;            }
     int     getSkip() const             {   return m_skipRules;             }
     const TLinkList<RewriteSubstFormat> *getEnv() const
@@ -252,6 +272,19 @@ public:
     int parseCookieAction(const char *pRuleStr, const char *pEnd);
     static void setLogger(LOG4CXX_NS::Logger *pLogger, const char *pId);
     static void error(const char *pError);
+
+    // OLS PRO (G3): Apache parity for status-only rewrite rules. Off by
+    // default (upstream behaviour, per pro/ROADMAP.md rules of engagement).
+    // Enabled at startup by OLSPRO_REWRITE_STATUS_PARITY=1 in the server's
+    // environment, or by a config hook calling setStatusParity(). Call it
+    // before rewrite rules are parsed: the unknown [R=4xx/5xx] code mapping
+    // is decided at parse time, everything else at request time.
+    static void setStatusParity(int enable)
+    {   s_iStatusParity = (enable != 0);    }
+    static int  getStatusParity()       {   return s_iStatusParity;     }
+
+private:
+    static int s_iStatusParity;
 };
 
 

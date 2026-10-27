@@ -26,7 +26,17 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <stdlib.h>
 #include <string.h>
+
+// OLS PRO (G3): off unless OLSPRO_REWRITE_STATUS_PARITY=1 (same convention as
+// the OLSPRO_APACHE_* switches); a config hook may override it later.
+static int envStatusParity()
+{
+    const char *p = getenv("OLSPRO_REWRITE_STATUS_PARITY");
+    return (p && *p == '1') ? 1 : 0;
+}
+int RewriteRule::s_iStatusParity = envStatusParity();
 
 static const char *s_pCurLine          = NULL;
 static const char *s_pLogId            = NULL;
@@ -1073,7 +1083,20 @@ int RewriteRule::parseOneFlag(const char *&pRuleStr, const char *pEnd,
             else
             {
                 m_statusCode = HttpStatusCode::getInstance().codeToIndex(pRuleStr);
-                if (m_statusCode == -1)
+                if ((m_statusCode == -1) && s_iStatusParity && (n == 3)
+                    && ((*pRuleStr == '4') || (*pRuleStr == '5'))
+                    && isdigit(pRuleStr[1]) && isdigit(pRuleStr[2]))
+                {
+                    // OLS PRO (G3): a 4xx/5xx code missing from the status
+                    // table (e.g. 499, 511). Upstream rejects the flag, which
+                    // drops this rule and every rule after it, so a blocking
+                    // rule silently stops blocking. Keep it a status rule.
+                    HttpLog::parse_warn(s_pCurLine,
+                        "unsupported HTTP status code in flag 'R', using 500");
+                    m_statusCode = SC_500;
+                    pRuleStr += n;
+                }
+                else if (m_statusCode == -1)
                     m_statusCode = SC_302;
                 else
                     pRuleStr += n;
@@ -1241,6 +1264,18 @@ int RewriteRule::parseRule(char *pRule, const char *pEnd,
         return LS_FAIL;
     if (parseRuleFlag(pRuleStr, pEnd, pMaps))
         return LS_FAIL;
+    // Upstream: [F] and [G] imply [L] and drop the substitution.
+    if ((m_action == RULE_ACTION_FORBID) || (m_action == RULE_ACTION_GONE))
+        m_flag |= RULE_FLAG_LAST | RULE_FLAG_NOREWRITE;
+    // OLS PRO (G3): mark status-only rules ([F], [G], [R=4xx/5xx]). With
+    // status parity enabled, getFlag() adds [L] + no-substitution and the
+    // engine stops as soon as one matches (Apache semantics). Without it an
+    // [R=404] rule keeps going exactly as upstream does. The marker is set
+    // here, but the switch is checked per request, so it also covers rules
+    // parsed before the switch was set.
+    if ((m_action == RULE_ACTION_FORBID) || (m_action == RULE_ACTION_GONE)
+        || ((m_action == RULE_ACTION_REDIRECT) && (m_statusCode >= SC_400)))
+        m_flag |= RULE_FLAG_STATUS;
     *((char *)argEnd) = '\0';
     int flag = LSRE_DEFAULT;
     if (m_flag & RULE_FLAG_NOCASE)

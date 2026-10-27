@@ -65,6 +65,51 @@ int main(int argc, char **argv)
     CHECK(sv.find("secure                  1") != std::string::npos);
     CHECK(sv.find("setUIDMode") == std::string::npos);
     CHECK(sv.find("map                     example.com_443 example.com, www.example.com") != std::string::npos);
+    // no cross-account symlink reads (EA4 SymLinksIfOwnerMatch parity)
+    CHECK(sv.find("allowSymbolLink         2") != std::string::npos);
+    CHECK(sv.find("allowSymbolLink         1") == std::string::npos);
+    CHECK(sv.find("restrained              1") != std::string::npos);
+    CHECK(sv.find("restrained              0") == std::string::npos);
+
+    // the fixture tree is complete: no Include/read errors
+    for (auto &w : cfg.warnings)
+    {
+        CHECK(w.message.find("Include target not found") == std::string::npos);
+        CHECK(w.message.find("matched no files") == std::string::npos);
+        CHECK(w.message.find("cannot read file") == std::string::npos);
+    }
+
+    // a plain Include wildcard matching nothing is an Apache 2.4 start error
+    // and must be reported (the loader treats it as an incomplete tree);
+    // inside <IfModule> it is only reported softly, IncludeOptional never.
+    {
+        std::string tmp = "/tmp/olspro_apacheconf_test.conf";
+        FILE *f = fopen(tmp.c_str(), "w");
+        CHECK(f != nullptr);
+        if (f)
+        {
+            fprintf(f, "Include /nonexistent-olspro/*.conf\n"
+                       "IncludeOptional /nonexistent-olspro/opt/*.conf\n"
+                       "<IfModule mod_nothing.c>\n"
+                       "Include /nonexistent-olspro/cond/*.conf\n"
+                       "</IfModule>\n"
+                       "Include /nonexistent-olspro/plain.conf\n");
+            fclose(f);
+            apacheconf::Config c2;
+            CHECK(apacheconf::load(tmp, opt, c2));
+            int hard = 0, soft = 0, notFound = 0, opt2 = 0;
+            for (auto &w : c2.warnings)
+            {
+                if (w.message.compare(0, 33, "Include wildcard matched no files") == 0) ++hard;
+                if (w.message.find("conditional Include matched no files") != std::string::npos) ++soft;
+                if (w.message.find("Include target not found") != std::string::npos
+                    || w.message.find("cannot read file") != std::string::npos) ++notFound;
+                if (w.message.find("/opt/") != std::string::npos) ++opt2;
+            }
+            CHECK(hard == 1 && soft == 1 && notFound == 1 && opt2 == 0);
+            remove(tmp.c_str());
+        }
+    }
 
     printf(fails ? "%d FAILED\n" : "all apacheconf checks passed\n", fails);
     return fails ? 1 : 0;

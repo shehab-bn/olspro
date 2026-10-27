@@ -158,8 +158,21 @@ struct Parser
         else
             files.push_back(pat);
 
-        if (files.empty() && !optional && pat.find_first_of("*?[") == std::string::npos)
+        bool wild = pat.find_first_of("*?[") != std::string::npos;
+        if (files.empty() && !optional && !wild)
             warn.push_back({file, line, "Include target not found: " + pat});
+        // Apache 2.4 refuses to start when a plain Include wildcard matches
+        // nothing; inside <IfModule>/<IfDefine> it may legitimately be
+        // skipped by Apache, so only report it softly there.
+        else if (files.empty() && !optional && wild && !isDir(pat))
+        {
+            bool conditional = parent.isSection
+                && (parent.name == "ifmodule" || parent.name == "ifdefine"
+                    || parent.name == "ifversion" || parent.name == "iffile");
+            warn.push_back({file, line, (conditional
+                ? "conditional Include matched no files: "
+                : "Include wildcard matched no files: ") + pat});
+        }
         for (auto &f : files)
             parseFile(f, parent, depth + 1, optional);
     }
@@ -689,8 +702,9 @@ std::string renderVhostConf(const VHost &v, const std::string &vhRoot)
     o << "context / {\n  location                $DOC_ROOT/\n  allowBrowse             1\n";
     o << "  rewrite  {\n    enable                1\n    autoLoadHtaccess      1\n  }\n}\n\n";
 
-    // ACME / cPanel DCV must stay reachable as plain static files (ROADMAP G2).
-    o << "context /.well-known/ {\n  location                $DOC_ROOT/.well-known/\n  allowBrowse             1\n}\n\n";
+    // No separate /.well-known/ context: the root context already serves it,
+    // and OLS logs a config ERROR for every docroot lacking that directory
+    // (most cPanel sites), which made `openlitespeed -t` fail (smoke S2).
 
     // ProxyPass -> OLS proxy extApp + context (cPanel service subdomains, G2).
     int pn = 0;
@@ -822,7 +836,12 @@ std::string renderServerConf(const Config &cfg, const std::string &vhostDir)
         o << "virtualhost " << id << " {\n";
         o << "  vhRoot                  " << (v.docRoot.empty() ? vhostDir + "/" + id : v.docRoot) << "\n";
         o << "  configFile              " << vhostDir << "/" << id << "/vhconf.conf\n";
-        o << "  allowSymbolLink         1\n  enableScript            1\n  restrained              0\n";
+        // allowSymbolLink 2 = follow only if the link and target owner match
+        // (EA4 SymLinksIfOwnerMatch); restrained keeps file access inside
+        // vhRoot. Static files are served by workers running as nobody, and
+        // cPanel's public_html is group nobody, so "1"/"0" would let one
+        // account symlink to another's wp-config.php.
+        o << "  allowSymbolLink         2\n  enableScript            1\n  restrained              1\n";
         // No setUIDMode/suEXEC: stock OLS has no lscgid; PHP runs in the
         // account's own FPM pool (chpro crash-loop 2026-10-24).
         o << "}\n\n";
@@ -834,8 +853,6 @@ std::string renderServerConf(const Config &cfg, const std::string &vhostDir)
         if (it == ls.end())
             continue;
         it->second.maps.push_back(&v);
-        if (wip == "*" || it->second.ip != "*")
-            ;  // fallthrough
         if (v.ssl.enabled)
         {
             it->second.secure = true;

@@ -9,6 +9,8 @@ SET(main_STAT_SRCS
    lshttpdmain.cpp
    serverinfo.cpp
    httpconfigloader.cpp
+   apacheconf.cpp
+   apacheconf_loader.cpp
    httpserver.cpp
    plainconf.cpp
    configctx.cpp
